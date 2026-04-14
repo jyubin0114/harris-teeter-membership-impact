@@ -1,0 +1,608 @@
+---
+title: "The Impact of Membership on Customer's Purchase"
+format: html
+editor: visual
+embed-resources: true
+---
+
+```{r}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+```
+
+## Project Summary
+
+Our client, Harris Teeter, is a leading regional supermarket chain in the United States, and they are asking us to answer this one qustion : **Does the VIC (Very Important Customer) membership ensure more purchases from each customer?** They are trying to see if it is worth enforcing a new promotional measure of offering a one-month free VIC memberhip trial to all customers and trying to see the effectiveness of this marketing schema beforehand.
+
+#### DAG Analysis
+
+From the DAG analysis, the criteria are D(Membership Status), X(Confounders - as gender, salary, age and marital status), and Y (Purchased amount). We will determine the TE through this Z, free membership trial as the X is already preassigned to each customer, and shows an imbalance of data.
+
+#### Methods Used
+
+For assuring a RCT, we used **Block treatment assignment** with probability of treatment being 0.5. For causal inference, we used **Exact Matching, Propensity Score Matching** and **IPTW Matching** and examined the effect of each through t-tests(p-value analysis).
+
+#### Results of Analysis
+
+From **Exact Matching,** the TE was **\$1,205.** From **Propensity Score Matching**, the TE was **\$1,207.** Finally, from Inverse Probability of Treatment Weighting, the TE was \$1,204. This shows a causal effect from D(Membership Status) -\> Y(Customer Spendings) were over \$1.2K for every method utilized.
+
+#### Business Implications to Clients
+
+Showing the effect of the membership status is \$1.2K/year per customer, we can assume that compared to the former sample data, Harris Teeter will be able to obtain substantial amount of revenue more if they enforce this new trial basis to boost exposure to the membership program. For example, if the conversion rate from non-membership customers to actual subscription was 10% (of 6.5K customers), the [**additional value from treatment would be \$7.8M**]{.underline}.
+
+## Data Simulation
+
+The following is the data to be used.
+
+**\[Dataset Dictionary\]**
+
+-   Customer ID: Primary Key for individual customers
+
+-   Membership: 1 = Enrolled in VIC membership, 0 = Not enrolled
+
+-   Gender: 1=Female, 0=Male
+
+-   Salary: Individual Annual Salary (in thousands. eg. 54.2 = \$54.2K)
+
+-   Age: 18-72
+
+-   Marital Status: 1= Married, 0 = Single
+
+-   Purchased: Dollar amount of total purchases in year 2025.
+
+**\[DAG Dictionary\]**
+
+-   Outcome(Y): Purchased
+
+-   Treatment(D): Membership
+
+-   Treatment Effect: Impact of having membership account on total purchased amount
+
+-   Potential Confounders(X): Gender, Salary, Age, Marital Status
+
+**\[Data Distribution\]**
+
+-   Outcome(Y) : Linear combination of treatment + Gaussian noise (mean=0, SD\^2)
+
+    -   With purchased amount being continuous scaling from small to large, and positive correlation to membership status, makes a linear combination
+
+    -   Mean, SD defined via LLM according to market research.
+
+-   Treatment(D) : 0.35:0.65 (Membership Owned, Non-owned) ratio to discuss selection bias and matching. + In reality people are less prone to going through the effort up signing up for memberships.
+
+-   Distribution of other confounders (X)
+
+    -   Gender: Female(1):Male(0) = 0.52:0.48
+
+    -   Salary = Log-normal distribution(0-20), median = 50
+
+        -   Less high-income individuals
+
+    -   Age = 18\~72, Normal distribution, Mean=37, SD = 12
+
+        -   Proposed per Harris Teeter customer age analysis
+
+    -   Marital Status: Married(1):Single(0) = 0.43:0.57
+
+**\[Data Simulation\]**
+
+Claude log: <https://claude.ai/chat/f264f04b-dc36-451f-8fe1-d8d73ed4a0c0>
+
+## Exploratory Data Analysis
+
+```{r}
+url <- "https://raw.githubusercontent.com/jyubin0114/harris-teeter-membership-impact/refs/heads/main/harris_teeter_customer_data.csv"
+
+data <- read.csv(url)
+
+library(tidyverse)
+library(skimr)
+
+df <- data %>%
+  mutate(
+    Membership = factor(Membership, levels = c(0,1), labels = c("No", "Yes")),
+    Gender = factor(Gender, levels = c(0,1), labels = c("Male", "Female")),
+    Marital_Status = factor(Marital_Status, levels = c(0,1), labels = c("Single", "Married"))
+  )
+
+```
+
+The dataset contains 10,000 customers and 7 variables, including three categorical covariates (membership, gender, marital status) and three continuous covariates (salary, age, and annual purchase amount). There are no missing values across variables, indicating high data quality. Salary and Purchased exhibit right-skewed behavior, which motivates additional distribution checks in the EDA.
+
+### Distribution of Key Variables
+
+```{r}
+ggplot(df, aes(x = Purchased)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of Annual Purchased Amount",
+       x = "Purchased ($)", y = "Count")
+
+ggplot(df, aes(x = log1p(Purchased))) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of log(1 + Purchased)",
+       x = "log(1 + Purchased)", y = "Count")
+```
+
+Purchased is right-skewed; we also examine log(1 + Purchased) for clearer visualization of the bulk of the distribution.
+
+```{r}
+ggplot(df, aes(x = Salary)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of Salary (in $K)",
+       x = "Salary ($K)", y = "Count")
+```
+
+```{r}
+ggplot(df, aes(x = Age)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of Age",
+       x = "Age", y = "Count")
+```
+
+Salary shows a similar right-skewed pattern, consistent with real-world income data, while age is concentrated around the mid-adult range.
+
+### Descriptive Differences by Membership Status
+
+```{r}
+balance_tbl <- df %>%
+  group_by(Membership) %>%
+  summarise(
+    n = n(),
+    mean_salary = mean(Salary),
+    mean_age = mean(Age),
+    prop_female = mean(Gender == "Female"),
+    prop_married = mean(Marital_Status == "Married"),
+    mean_purchased = mean(Purchased)
+  )
+
+balance_tbl
+```
+
+### Covariate Balance and Evidence of Selection Bias
+
+```{r}
+smd_cont <- function(x, d){
+  x1 <- x[d == "Yes"]; x0 <- x[d == "No"]
+  (mean(x1) - mean(x0)) / sqrt((var(x1) + var(x0)) / 2)
+}
+
+smd_bin <- function(x, d){
+  x1 <- x[d == "Yes"]; x0 <- x[d == "No"]
+  p1 <- mean(x1); p0 <- mean(x0)
+  (p1 - p0) / sqrt((p1*(1-p1) + p0*(1-p0)) / 2)
+}
+
+smds <- tibble(
+  variable = c("Salary", "Age", "Female", "Married"),
+  smd = c(
+    smd_cont(df$Salary, df$Membership),
+    smd_cont(df$Age, df$Membership),
+    smd_bin(df$Gender == "Female", df$Membership),
+    smd_bin(df$Marital_Status == "Married", df$Membership)
+  )
+)
+
+smds
+```
+
+We assess covariate balance using standardized mean differences (SMD). As a rule of thumb, \|SMD\| \> 0.1 indicates meaningful imbalance between the membership and non-membership groups.
+
+```{r}
+ggplot(df, aes(x = Membership, y = Purchased)) +
+  geom_boxplot() +
+  labs(title = "Purchased by Membership Status",
+       x = "Membership", y = "Purchased ($)")
+```
+
+The enrolled group appears to have higher raw annual purchases; however, this comparison is purely correlational. Given observed differences in salary and age, the naive gap may reflect selection bias rather than a causal membership effect.
+
+### Summary
+
+The exploratory analysis shows that customers who join the loyalty program are systematically different from those who do not. In particular, members tend to have higher income, are slightly older, and are more likely to be female and married. These characteristics are also strongly related to purchasing behavior. As a result, differences in observed spending between members and non-members should be interpreted with caution, as they may reflect customer selection rather than the effect of the loyalty program itself.
+
+## Methodology (RCT)
+
+### Non-technical description of the method
+
+To study the causal effect of a membership-related marketing intervention, we implement the structure of a randomized controlled trial (RCT.) Because the observed dataset does not contain an actual randomized assignment, we simulate an experiment in which customers are randomly offered a 1-month free membership trial. This allows us to estimate the average causal effect of the offer using an intention-to-treat (ITT) framework.
+
+```{r}
+library(tidyverse)
+library(tableone)
+library(sandwich)
+library(lmtest)
+```
+
+### Technical implementation
+
+1.  **Block construction using a pre-treatment covariate**
+
+    To implement a blocked RCT, we stratify customers based on salary, a key pre-treatment covariate that strongly predicts both purchases and membership enrollment. Salary is divided into quartiles, and each customer is assigned to a salary block. Blocking ensures balance on this important covariate and improves the precision of treatment effect estimates.
+
+```{r}
+data <- data %>% mutate(Salary_q = ntile(Salary, 4), Block_id = paste0("Sal_q", Salary_q))
+
+# Quick block sizes (informational)
+block_sizes <- data %>% count(Block_id) %>% arrange(desc(n))
+print(block_sizes)
+```
+
+2.  **Block treatment assignment (randomization)**
+
+    Within each salary block, we randomly assign the free membership trial offer `Free_trial_offer` with probability 0.5. This block treatment assignment ensures that randomization occurs within homogeneous strata while maintaining equal treatment probability across blocks.
+
+```{r}
+set.seed(202601)
+data <- data %>% group_by(Block_id) %>%
+  mutate(Free_trial_offer = rbinom(n(), 1, 0.5)) %>%
+  ungroup()
+
+# Check overall and by-block assignment rates
+cat("Overall offer rate:", mean(data$Free_trial_offer), "\n")
+print(data %>% group_by(Block_id) %>% summarize(n = n(), offer_rate = mean(Free_trial_offer)) %>% arrange(desc(n)))
+```
+
+3.  **Balance check for the randomized assignment**
+
+    As a sanity check, we examine the distribution of key pre-treatment covariates across treatment status. By construction, the randomized offer should be independent of pre-treatment characteristics.
+
+```{r}
+# means of key pre-treatment X by Z
+cat("Mean salary by Z: \n")
+print(data %>% group_by(Free_trial_offer) %>% summarize(mean_salary = mean(Salary, na.rm=TRUE), n = n()))
+```
+
+4.  **ITT estimation with block fixed effects**
+
+    We estimate the treatment effect using an ITT specification. Purchases are regressed on the randomized offer indicator, controlling for block fixed effects to account for systematic differences across salary strata. Robust (HC1) standard errors are used.
+
+```{r}
+# Purchased ~ Z + block fixed effects
+# Estimate ITT vis OLS controlling for block fixed effects with robust SE.
+data$Block_factor <- factor(data$Block_id)
+itt_model <- lm(Purchased ~ Free_trial_offer + Block_factor, data=data)
+itt_se <- vcovHC(itt_model, type = "HC1")
+cat("ITT estimate (Z -> Y):\n")
+print(coeftest(itt_model, vcov. = itt_se))
+```
+
+5.  **First-stage regression (compliance check)**
+
+    We also estimate a first-stage regression to assess how strongly the randomized offer translates into actual membership enrollment. This step diagnoses compliance in the experiment.
+
+```{r}
+# Effect Z --> D
+# Check how strongly the offer induced membership.
+fs_model <- lm(Membership ~ Free_trial_offer + Block_factor, data=data)
+fs_se <- vcovHC(fs_model, type = "HC1")
+cat("First-stage estimate (Z -> D):\n")
+print(coeftest(fs_model, vcov. = fs_se))
+```
+
+### Justification and Assumptions
+
+Salary is chosen as the blocking variable because it is a strong pre-treatment predictor of both purchases and membership. A blocked RCT ensures balance on this key covariate while remaining simple to implement. The analysis relies on the assumption that the randomized offer is independent of pre-treatment covariates and that there is no interference across units. The randomized offer is simulated for methodological illustration and is not used in subsequent matching analyses.
+
+## Findings (RCT)
+
+-   **Blocking and randomization:** We stratified by salary quartiles and randomized a free_trial_offer within each block at 50% probability. Pre-treatment characteristics appear similar across offer groups. Block assignment rates (\~0.499–0.518) are consistent with successful within-block randomization.
+
+-   **ITT result:** The ITT estimate is **\$11.71 (SE = 18.23, p = 0.52)** — not statistically significant. This effect is economically small relative to average annual purchases and statistically insignificant. We cannot conclude the offer meaningfully increased purchases on average.
+
+-   **First-stage (compliance):** The offer increased membership probability by \~**1.6 percentage points (p = 0.11)**, which is not statistically significant, indicating weak take-up of the offer.
+
+```{r}
+results_summary <- data.frame(
+  Metric = c("ITT Effect on Purchases", "First Stage Effect on Membership"),
+  Estimate = c(coef(itt_model)["Free_trial_offer"],
+               coef(fs_model)["Free_trial_offer"])
+)
+print(results_summary)
+```
+
+-   **Interpretation:** Non-significant ITT may reflect no true effect, limited power, or a weak offer-to-membership pathway. Given the weak first-stage, estimating the causal effect of membership (D→Y) via IV would be unreliable.
+
+-   **Recommendations:** (i) strengthen the offer design (e.g., immediate sign-up bonus), (ii) increase sample size or target higher-takeup subgroups, and (iii) combine matching-based observational adjustments (Exact, PSM, IPTW) with experimental insights for robust inference. Do not include the simulated `free_trial_offer` as a covariate in matching analyses.
+
+## Methodology (Matching)
+
+### Non-technical description of the method
+
+Because membership enrollment is self-selected rather than randomized, naive comparisons suffer from selection bias. We therefore employ matching-based causal inference methods to construct comparable treated and control groups based on pre-treatment covariates. Matching aims to approximate the counterfactual outcomes by pairing members and non-members with similar characteristics. We implement Exact Matching, Propensity Score Matching, and Inverse Probability of Treatment Weighting (IPTW) to assess robustness.
+
+### Technical implementation
+
+```{r}
+library(MatchIt)
+library(marginaleffects) # for avg_comparision & avg_predictions
+library(ggplot2)
+library(cobalt)
+library(gridExtra)
+library(sandwich)
+library(lmtest)
+set.seed(202601)
+```
+
+#### Exact Matching
+
+Exact Matching pairs treated and control units that have identical values for selected covariates. This approach eliminates bias from those covariates entirely but may discard many observations when covariates are continuous or high-dimensional. In our setting, we perform Exact Matching on Gender and Marital Status, which are discrete and economically meaningful pre-treatment variables.
+
+```{r}
+# Exact Matching on Gender and Marital Status
+matches_exact <- matchit(
+  Membership ~ Gender + Marital_Status, data=data, method = "exact"
+)
+
+# Print summary text to file
+print(summary(matches_exact))
+
+# Extract mathced dataset
+matched_exact <- match.data(matches_exact)
+```
+
+ATE/ATT via Difference-in-Means and regression (with robust SE)
+
+-   On matched sample run difference-in-means and weighted regression.
+
+```{r}
+# Difference in means (treated - control) on matched sample
+mean_treated <- mean(matched_exact$Purchased[matched_exact$Membership == 1], na.rm = TRUE)
+mean_control <- mean(matched_exact$Purchased[matched_exact$Membership == 0], na.rm = TRUE)
+dim_estimate <- mean_treated - mean_control
+
+cat("Exact Matching: Difference-in-means (Treated - Control):", dim_estimate, "\n")
+
+# Weighted regression (include covariates for precision)
+# Use 'weights' column generated by MatchIt
+model_exact <- lm(Purchased ~ Membership + Age + Salary + Gender + Marital_Status,
+                  data = matched_exact, weights = weights)
+
+# Robust SE
+se_exact <- vcovHC(model_exact, type = "HC1")
+coefs_exact <- coeftest(model_exact, vcov. = se_exact)
+print(coefs_exact)
+```
+
+#### Propensity Score Matching
+
+To address the problems of Exact Matching, we implement Propensity Score Matching, which summarizes multiple covariates into a single scalar, the probability of receiving treatment conditional on covariates. We estimate propensity scores using a logistic regression of membership on pre-treatment covariates and then match treated and control units with similar propensity scores using nearest-neighbor matching.
+
+```{r}
+# Propensity Score Matching using Nearest Neighbor
+matches_psm <- matchit(
+  Membership ~ Age + Salary + Gender + Marital_Status,
+  data = data,
+  method = "nearest",
+  distance = "logit",
+  estimand = "ATT"
+)
+
+# Summary
+psm_sum <- summary(matches_psm)
+print(psm_sum)
+
+# Extract matched data
+matched_psm <- match.data(matches_psm)
+```
+
+Print standardized mean differences and estimate ATT via avg_comparisons on matched sample.
+
+```{r}
+# Print SMD table
+cat("PSM: Standardized Mean Differences (before & after):\n")
+print(psm_sum$sum.all) #before
+```
+
+```{r}
+print(psm_sum$sum.matched) #after
+```
+
+```{r}
+
+# Estimate ATT via outcome regression on matched sample with MathIt weight
+model_psm <- lm(Purchased ~ Membership + Age + Salary + Gender + Marital_Status,
+                data = matched_psm, weights = weights)
+
+# Robust SE and print
+se_psm <- vcovHC(model_psm, type = "HC1")
+cat("PSM regression coefficients:\n")
+print(coeftest(model_psm, vcov. = se_psm))
+```
+
+```{r}
+# Use marginaleffects to compute ATT
+te_psm <- avg_comparisons(model_psm, variables = "Membership",
+                          newdata = subset(matched_psm, Membership == 1),
+                          vcov = ~subclass, wts = "weights")
+
+cat("PSM ATT estimate: \n")
+print(te_psm)
+```
+
+#### IPTW
+
+Unlike matching, IPTW retains all observations but adjusts their influence. We estimate the propensity score using the same specification as in Prepensity Score Matching and compute stabilized weights to reduce variance.
+
+```{r}
+library(dplyr)
+```
+
+```{r}
+# Estimate propensity scores
+ps_model <- glm(
+  Membership ~ Age +Salary + Gender + Marital_Status,
+  data = data,
+  family = binomial
+)
+
+data$pscore <- ps_model$fitted.values
+
+# Stabilized IPTW weights
+p_treat <- mean(data$Membership)
+
+data <- data %>%
+  mutate(
+    iptw_weight = ifelse(
+      Membership == 1,
+      p_treat / pscore,
+      (1 - p_treat) / (1 - pscore)
+    )
+  )
+```
+
+Balance diagnostics with weights.
+
+```{r}
+bal_iptw <- bal.tab(Membership ~ Age + Salary + Gender + Marital_Status,
+                    data = data, weights = data$iptw_weight, method = "weighting", un = TRUE)
+print(bal_iptw)
+```
+
+Weighted regression to estimate ATE
+
+```{r}
+model_iptw <- lm(Purchased ~ Membership + Age + Salary + Gender + Marital_Status,
+                 data = data, weights = iptw_weight)
+se_iptw <- vcovHC(model_iptw, type = "HC1")
+print(coeftest(model_iptw, vcov. = se_iptw))
+```
+
+```{r}
+# Outcome regression on matched / weighted data
+model_matching <- lm(
+  Purchased ~ Membership + Age + Salary + Gender + Marital_Status,
+  data = matched_psm,
+  weights = weights
+)
+
+# For IPTW
+model_iptw <- lm(
+  Purchased ~ Membership + Age + Salary + Gender + Marital_Status,
+  data = data,
+  weights = iptw_weight
+)
+```
+
+### Findings (Matching)
+
+Using matching-based causal inference methods, we find consistent evidence that membership is associated with substantially higher annual customer spending.
+
+1.  **Exact Matching** Exact Matching on gender and marital status yields an estimated increase of approximately **\$1,205** in annual purchases for members relative to non-members. The Love Plot confirms that matching achieves perfect balance on these covariates, with standardized mean differences reduced to zero after adjustment. While this approach ensures perfect balance on the matched covariates, it does not account for all observed characteristics.
+
+```{r}
+bal_exact <- bal.tab(matches_exact, un = TRUE)
+love.plot(bal_exact, stats="mean.diffs", abs=TRUE, thresholds=c(m=.1),
+          var.order="unadjusted",
+          title="Covariate Balance – Exact Matching")
+```
+
+2.  **Propensity Score Matching** Propensity Score Matching (nearest-neighbor, ATT estimand) produces a very similar estimate. We achieved substantial covariate balance for this method, as shown by the Love Plot, with standardized mean differences reduced after adjustment. The average treatment effect on the treated is **\$1,207** (SE = 8.57), with a 95% confidence interval of **\[\$1,190, \$1,224\]**, which is highly statistically significant (p \< 0.001). This suggests that, after accounting for age, salary, gender, and marital status, loyalty membership remains associated with significantly higher annual spending.
+
+```{r}
+bal_psm <- bal.tab(matches_psm, un = TRUE)
+love.plot(
+  bal_psm,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = .1),
+  var.order = "unadjusted",
+  title = "Covariate Balance – Propensity Score Matching",
+  sample.names = c("Unadjusted", "Matched")
+)
+```
+
+3.  **IPTW Matching** Inverse Probability of Treatment Weighting (IPTW) yields an estimate of approximately **\$1,204** additional annual purchases for members relative to non-members (robust SE ≈ 8.14, p \< 0.001).
+
+The covariate balance plot shows that after weighting, standardized mean differences for Age, Salary, Gender, and Marital Status are all extremely close to zero. In contrast, the unadjusted sample exhibits noticeable imbalance, especially for Salary and Age.
+
+```{r}
+love.plot(
+  bal_iptw,
+  stats = "mean.diffs",
+  abs = TRUE,
+  thresholds = c(m = .1),
+  var.order = "unadjusted",
+  title = "Covariate Balance – IPTW (Std. Mean Differences)",
+  sample.names = c("Unadjusted", "Weighted")
+)
+```
+
+The distribution of stabilized IPTW weights is centered near 1, with most weights concentrated below 1.5 and only a small right tail. This suggests that no observations receive excessively large influence and that the weighted estimation remains stable and well-behaved.
+
+```{r}
+ggplot(data, aes(x = iptw_weight)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Distribution of Stabilized IPTW Weights",
+    x = "Stabilized IPTW Weight",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+**Technical Summary:** All three statistical methods give almost the same estimate of the membership effect, which increases our confidence that the result is not driven by a particular modeling choice. The confidence intervals are tight and well above zero, meaning the effect is estimated very precisely and is clearly positive. In addition, the balance checks show that, after adjustment, members and non-members look very similar in terms of age, salary, gender, and marital status. Together, this suggests that the higher spending we observe among members is unlikely to be explained by these background differences, and instead reflects a genuine effect associated with membership.
+
+```{r}
+extract_result <- function(model, method_name) {
+  robust_se <- vcovHC(model, type = "HC1")
+  ct <- coeftest(model, vcov = robust_se)
+  
+  est <- ct["Membership", "Estimate"]
+  se  <- ct["Membership", "Std. Error"]
+  p   <- ct["Membership", "Pr(>|t|)"]
+  
+  p_formatted <- ifelse(p < 0.001, "< 0.001", sprintf("%.3f", p))
+  
+  tibble(
+    Method = method_name,
+    Estimate = round(est, 3),
+    SE_HC1 = round(se, 3),
+    CI_Lower = round(est - 1.96 * se, 3),
+    CI_Upper = round(est + 1.96 * se, 3),
+    p_value = p_formatted
+  )
+}
+
+results_summary <- bind_rows(
+  extract_result(model_exact, "Exact Matching"),
+  extract_result(model_psm,   "Propensity Score Matching"),
+  extract_result(model_iptw,  "IPTW")
+)
+
+print(results_summary)
+```
+
+```{r}
+ggplot(results_summary, aes(x = Method, y = Estimate)) +
+  geom_point(size = 4, color = "#1f2d3d") +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper),
+                width = 0.12, size = 1.1, color = "#1f2d3d") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red", size = 1) +
+  
+  coord_cartesian(ylim = c(1180, 1230)) +
+  
+  labs(
+    title = "Estimated Membership Effect Across Matching Methods",
+    subtitle = "Zoomed scale highlights consistency across methods",
+    y = "Estimated Increase in Annual Purchases ($)",
+    x = "Method"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 18),
+    axis.title = element_text(face = "bold")
+  )
+```
+
+**Non technical Summary:** Across three different statistical methods, we find strong and consistent evidence that customers enrolled in the VIC loyalty program spend substantially more per year.
+
+After accounting for differences in customer demographics and income: 1. Members spend about \$1,200 more per year than comparable non-members 2. This result is stable regardless of the analytical approach used 3. The effect is statistically precise and highly reliable
+
+In practical terms, this means that membership participation is strongly associated with increased customer value, not just differences in who chooses to sign up.
+
+**Business implications for Harris Teeter:** VIC membership represents a measurable economic asset per customer. With an estimated spending lift of roughly \$1,200 per member per year, the program is not just a retention tool but a source of incremental revenue.
+
+This figure helps anchor pricing and promotion decisions. Any discounts, rewards, or sign-up incentives that cost meaningfully less than the expected incremental spend can be justified on economic grounds. In other words, the estimated value per member provides an upper bound for how much Harris Teeter can afford to invest in acquiring or retaining a VIC customer while still generating net gain.
+
+It also suggests that promotions tied to membership enrollment — rather than broad, untargeted discounts — are likely to be more efficient. Encouraging customers to join the program may create longer-term spending lift, rather than just shifting the timing of purchases.
+
+Overall, the VIC program should be managed not just as a loyalty feature, but as a customer-level value driver, with pricing and promotional strategy aligned to the incremental revenue it appears to generate.
